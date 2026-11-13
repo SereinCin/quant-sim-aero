@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+src/*.ll
+src/*.o
+src/*.obj
+src/*.exe
+src/*.dll

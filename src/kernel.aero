@@ -1,0 +1,952 @@
+// aero-quant kernel: technical indicators for quant-sim, at native speed.
+//
+// Built with `aero build src/kernel.aero --pyext` -> kernel.pyd (Windows) /
+// kernel.so (Linux, macOS). Nothing here touches the filesystem or the network:
+// every exported function is a pure function of its text arguments.
+//
+// Wire format (see PLAN.md section 4): one bar per line, comma separated,
+// header-less, columns addressed by 0-based index:
+//
+//     date,sym,open,high,low,close,volume
+//
+// Output is a small block of sections. Each section starts with a directive
+// line `#section <name> <ncols>` followed by one data line per value. Floats
+// are printed with "%.17g", which round-trips through Python's float()
+// without loss; integers are printed as plain decimal.
+//
+// A note on arithmetic: Aero has no i64 <-> f64 conversion of any kind (no
+// `as f64`, no implicit widening, and io_i2d only exists inside aero-io's C
+// shim). So anything numeric stays on the f64 side, and small integer
+// quantities are converted by counting in floating point (i2f below). That is
+// fine for periods and window sizes, and it is the only way across.
+//
+// A note on the formulas: every indicator here reproduces what upstream
+// quant-sim actually computes, not what its docstrings claim. RSI and ATR
+// there are plain means rather than Wilder smoothing, MACD rebuilds DIF over a
+// trailing window, and MA degrades to the mean of the whole series when the
+// window is longer than the data. Gate A1 compares against a frozen copy of
+// the upstream file, so these quirks are the specification. Do not "fix" them
+// here; see PLAN.md sections 2.3 and 5.1.
+
+// 10^n as f64. Only used for exponents the protocol allows (|n| <= 22), which
+// is where repeated multiplication by 10.0 stays exact.
+fn pow10f(e: i64) -> f64 {
+    let mut a = e;
+    let mut neg = 0;
+    if (e < 0) {
+        neg = 1;
+        a = 0 - e;
+    }
+    let mut r: f64 = 1.0;
+    let mut k: i64 = 0;
+    while (k < a) {
+        r = r * 10.0;
+        k = k + 1;
+    }
+    if (neg == 1) {
+        return 1.0 / r;
+    }
+    return r;
+}
+
+// i64 -> f64 by counting. Linear in v, so keep v small (periods, window sizes).
+// Negative values are supported because the params block carries -5, -10, ...
+fn i2f(v: i64) -> f64 {
+    let mut a = v;
+    let mut neg = 0;
+    if (v < 0) {
+        neg = 1;
+        a = 0 - v;
+    }
+    let mut r: f64 = 0.0;
+    let mut i: i64 = 0;
+    while (i < a) {
+        r = r + 1.0;
+        i = i + 1;
+    }
+    if (neg == 1) {
+        return 0.0 - r;
+    }
+    return r;
+}
+
+// f64 -> text. The caller owns the result and must str_free it.
+fn f2s(x: f64) -> str {
+    return format("%.17g", x);
+}
+
+// Offset of the line break that ends the row starting at `ls`.
+fn row_end(s: str, ls: i64, n: i64) -> i64 {
+    let mut k = ls;
+    while (k < n) {
+        if (s[k] == 10) {
+            break;
+        }
+        k = k + 1;
+    }
+    return k;
+}
+
+// Offset of the first character of field `idx` inside the row [ls, le).
+fn field_start(s: str, ls: i64, le: i64, idx: i64) -> i64 {
+    let mut j = ls;
+    let mut pos: i64 = 0;
+    while (j < le) {
+        if (pos == idx) {
+            break;
+        }
+        if (s[j] == 44) {
+            pos = pos + 1;
+        }
+        j = j + 1;
+    }
+    return j;
+}
+
+// Offset just past the last character of the cell starting at `st`.
+fn field_stop(s: str, st: i64, le: i64) -> i64 {
+    let mut k = st;
+    while (k < le) {
+        let c = s[k];
+        if ((c == 44) || (c == 13)) {
+            break;
+        }
+        k = k + 1;
+    }
+    return k;
+}
+
+// Decimal text in [j, stop) -> f64.
+//
+// Digits come from a literal table so no widening is needed; the fraction is
+// scaled once by an exact power of ten instead of being accumulated digit by
+// digit. Measured worst case is 1.3 ulp across the protocol's input domain
+// (PLAN.md section 12.2).
+fn dec_f64(s: str, j: i64, stop: i64) -> f64 {
+    let tbl: [f64; 10] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    let mut i = j;
+    let mut neg = 0;
+    if ((i < stop) && (s[i] == 45)) {
+        neg = 1;
+        i = i + 1;
+    }
+    if ((i < stop) && (s[i] == 43)) {
+        i = i + 1;
+    }
+
+    let mut acc: f64 = 0.0;
+    while ((i < stop) && (s[i] >= 48) && (s[i] <= 57)) {
+        let d = s[i];
+        acc = acc * 10.0 + tbl[d - 48];
+        i = i + 1;
+    }
+
+    if ((i < stop) && (s[i] == 46)) {
+        i = i + 1;
+        let mut fsig: f64 = 0.0;
+        let mut nd: i64 = 0;
+        while ((i < stop) && (s[i] >= 48) && (s[i] <= 57)) {
+            let d = s[i];
+            fsig = fsig * 10.0 + tbl[d - 48];
+            nd = nd + 1;
+            i = i + 1;
+        }
+        acc = acc + fsig / pow10f(nd);
+    }
+
+    if ((i < stop) && ((s[i] == 101) || (s[i] == 69))) {
+        i = i + 1;
+        let mut eneg = 0;
+        if ((i < stop) && ((s[i] == 45) || (s[i] == 43))) {
+            if (s[i] == 45) {
+                eneg = 1;
+            }
+            i = i + 1;
+        }
+        let mut ev: i64 = 0;
+        while ((i < stop) && (s[i] >= 48) && (s[i] <= 57)) {
+            let d = s[i];
+            ev = ev * 10 + (d - 48);
+            i = i + 1;
+        }
+        if (eneg == 1) {
+            acc = acc / pow10f(ev);
+        }
+        else {
+            acc = acc * pow10f(ev);
+        }
+    }
+
+    if (neg == 1) {
+        acc = 0.0 - acc;
+    }
+    return acc;
+}
+
+// Numeric value of column `col` in the row [ls, le), as f64.
+fn col_f64(s: str, ls: i64, le: i64, col: i64) -> f64 {
+    let st = field_start(s, ls, le, col);
+    if (st >= le) {
+        return 0.0;
+    }
+    let sp = field_stop(s, st, le);
+    return dec_f64(s, st, sp);
+}
+
+// How many non-empty rows the payload holds.
+fn count_rows(s: str, n: i64) -> i64 {
+    let mut cnt: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let re = row_end(s, i, n);
+        if (re > i) {
+            cnt = cnt + 1;
+        }
+        i = re + 1;
+    }
+    return cnt;
+}
+
+// The indicators run over one column at a time, so every helper below walks
+// the payload itself: `s` is the whole block, `n` its length, `cnt` the row
+// count (the callers already needed it), `col` the column index. Passing the
+// row count in saves a second scan and keeps the walk isolated to one loop.
+
+// Upstream `_ma`: the mean of the last `period` values, or of the whole column
+// when the column is shorter than the window. That fallback is deliberate --
+// it is what the frozen reference does, and it is not NaN.
+fn ma_val(s: str, n: i64, cnt: i64, col: i64, period: i64) -> f64 {
+    if (cnt == 0) {
+        return 0.0;
+    }
+    let mut per = period;
+    if (per < 1) {
+        per = 1;
+    }
+    let mut first = cnt - per;
+    if (first < 0) {
+        first = 0;
+    }
+
+    let mut acc: f64 = 0.0;
+    let mut used: f64 = 0.0;
+    let mut idx: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let re = row_end(s, i, n);
+        if (re > i) {
+            if (idx >= first) {
+                acc = acc + col_f64(s, i, re, col);
+                used = used + 1.0;
+            }
+            idx = idx + 1;
+        }
+        i = re + 1;
+    }
+    if (used == 0.0) {
+        return 0.0;
+    }
+    return acc / used;
+}
+
+// Upstream `_ema`: seeded on the first value, then r += k * (v - r) with
+// k = 2/(period+1). Algebraically the same as the reference's v*k + r*(1-k);
+// the two differ in the last bits, which is why A1 carries a 1e-9 tolerance.
+fn ema_val(s: str, n: i64, cnt: i64, col: i64, period: i64) -> f64 {
+    if (cnt == 0) {
+        return 0.0;
+    }
+    let mut per = period;
+    if (per < 1) {
+        per = 1;
+    }
+    let k = 2.0 / (i2f(per) + 1.0);
+
+    let mut r: f64 = 0.0;
+    let mut started = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let re = row_end(s, i, n);
+        if (re > i) {
+            let v = col_f64(s, i, re, col);
+            if (started == 0) {
+                r = v;
+                started = 1;
+            }
+            else {
+                r = r + k * (v - r);
+            }
+        }
+        i = re + 1;
+    }
+    return r;
+}
+
+// Value of the last row in `col`. Returns 0.0 for an empty payload.
+fn last_val(s: str, n: i64, cnt: i64, col: i64) -> f64 {
+    let mut v: f64 = 0.0;
+    let mut idx: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let re = row_end(s, i, n);
+        if (re > i) {
+            if (idx == cnt - 1) {
+                v = col_f64(s, i, re, col);
+            }
+            idx = idx + 1;
+        }
+        i = re + 1;
+    }
+    return v;
+}
+
+// Upstream `_rsi`, which is a simple mean of the last `period` up/down moves
+// despite the docstring saying "Wilder smoothing". Short column -> 50.0, and a
+// column with no down moves at all -> 100.0.
+fn rsi_val(s: str, n: i64, cnt: i64, col: i64, period: i64) -> f64 {
+    let mut per = period;
+    if (per < 1) {
+        per = 1;
+    }
+    if (cnt < per + 1) {
+        return 50.0;
+    }
+    let first = cnt - per;
+
+    let mut gain: f64 = 0.0;
+    let mut loss: f64 = 0.0;
+    let mut prev: f64 = 0.0;
+    let mut started = 0;
+    let mut idx: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let re = row_end(s, i, n);
+        if (re > i) {
+            let v = col_f64(s, i, re, col);
+            if (started == 1) {
+                if (idx >= first) {
+                    let d = v - prev;
+                    if (d > 0.0) {
+                        gain = gain + d;
+                    }
+                    else {
+                        loss = loss + (0.0 - d);
+                    }
+                }
+            }
+            prev = v;
+            started = 1;
+            idx = idx + 1;
+        }
+        i = re + 1;
+    }
+
+    if (loss == 0.0) {
+        return 100.0;
+    }
+    let avg_gain = gain / i2f(per);
+    let avg_loss = loss / i2f(per);
+    let rs = avg_gain / avg_loss;
+    return 100.0 - 100.0 / (1.0 + rs);
+}
+
+// Upstream `_atr`: true range per bar, then the simple mean of the last
+// `period` of them (again not Wilder). Short column -> 0.0.
+fn atr_val(s: str, n: i64, cnt: i64, hcol: i64, lcol: i64, ccol: i64, period: i64) -> f64 {
+    let mut per = period;
+    if (per < 1) {
+        per = 1;
+    }
+    if (cnt < per + 1) {
+        return 0.0;
+    }
+    // True ranges start at the second bar, so the window is the rows from
+    // cnt - period onwards.
+    let first = cnt - per;
+
+    let mut acc: f64 = 0.0;
+    let mut prev_close: f64 = 0.0;
+    let mut started = 0;
+    let mut idx: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let re = row_end(s, i, n);
+        if (re > i) {
+            let h = col_f64(s, i, re, hcol);
+            let l = col_f64(s, i, re, lcol);
+            let c = col_f64(s, i, re, ccol);
+            if (started == 1) {
+                if (idx >= first) {
+                    let mut tr = h - l;
+                    let mut a = h - prev_close;
+                    if (a < 0.0) {
+                        a = 0.0 - a;
+                    }
+                    let mut b = l - prev_close;
+                    if (b < 0.0) {
+                        b = 0.0 - b;
+                    }
+                    if (a > tr) {
+                        tr = a;
+                    }
+                    if (b > tr) {
+                        tr = b;
+                    }
+                    acc = acc + tr;
+                }
+            }
+            prev_close = c;
+            started = 1;
+            idx = idx + 1;
+        }
+        i = re + 1;
+    }
+    return acc / i2f(per);
+}
+
+// Upstream's volume ratio: today's volume over the mean of the five before it,
+// floored at 1, and 1.0 outright when there are fewer than six bars. The
+// rounding to two decimals happens on the Python side, like every other
+// rounding in this kernel.
+fn vr_val(s: str, n: i64, cnt: i64, col: i64) -> f64 {
+    if (cnt < 6) {
+        return 1.0;
+    }
+    let mut last: f64 = 0.0;
+    let mut sum5: f64 = 0.0;
+    let mut idx: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let re = row_end(s, i, n);
+        if (re > i) {
+            let v = col_f64(s, i, re, col);
+            if (idx == cnt - 1) {
+                last = v;
+            }
+            if ((idx >= cnt - 6) && (idx <= cnt - 2)) {
+                sum5 = sum5 + v;
+            }
+            idx = idx + 1;
+        }
+        i = re + 1;
+    }
+    let mut mean = sum5 / 5.0;
+    if (mean < 1.0) {
+        mean = 1.0;
+    }
+    return last / mean;
+}
+
+// One of the three MACD numbers per call; `which` picks it:
+//   0 -> DIF, 1 -> DEA, 2 -> the histogram.
+//
+// The reference rebuilds DIF over the trailing window for every bar in it and
+// then takes an EMA of those. That is the same as tracking the two prefix EMAs
+// forward and appending each step, so this walks the payload once and keeps
+// the DEA recursion alive alongside the two EMAs -- no array, no second pass.
+// Returns 0.0 for every part when the column is too short.
+fn macd_part(s: str, n: i64, cnt: i64, col: i64, fast: i64, slow: i64, sig: i64, which: i64) -> f64 {
+    let mut fa = fast;
+    if (fa < 1) {
+        fa = 1;
+    }
+    let mut sl = slow;
+    if (sl < 1) {
+        sl = 1;
+    }
+    let mut sg = sig;
+    if (sg < 1) {
+        sg = 1;
+    }
+    if (cnt < sl + sg) {
+        return 0.0;
+    }
+
+    let kf = 2.0 / (i2f(fa) + 1.0);
+    let ks = 2.0 / (i2f(sl) + 1.0);
+    let kg = 2.0 / (i2f(sg) + 1.0);
+
+    // The reference iterates the last 60 bars and skips any index below the
+    // slow period, so the DIF series starts at whichever of the two is later.
+    let mut from = cnt - 60;
+    if (from < sl) {
+        from = sl;
+    }
+
+    let mut ef: f64 = 0.0;
+    let mut es: f64 = 0.0;
+    let mut dif: f64 = 0.0;
+    let mut dea: f64 = 0.0;
+    let mut ndifs: i64 = 0;
+    let mut idx: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let re = row_end(s, i, n);
+        if (re > i) {
+            let v = col_f64(s, i, re, col);
+            if (idx == 0) {
+                ef = v;
+                es = v;
+            }
+            else {
+                ef = ef + kf * (v - ef);
+                es = es + ks * (v - es);
+            }
+            dif = ef - es;
+            if (idx >= from) {
+                if (ndifs == 0) {
+                    dea = dif;
+                }
+                else {
+                    dea = dea + kg * (dif - dea);
+                }
+                ndifs = ndifs + 1;
+            }
+            idx = idx + 1;
+        }
+        i = re + 1;
+    }
+
+    if (which == 0) {
+        return dif;
+    }
+    if (ndifs < sg) {
+        return 0.0;
+    }
+    if (which == 1) {
+        return dea;
+    }
+    return (dif - dea) * 2.0;
+}
+
+// Upstream `_trend`, as an enum code instead of a Chinese string: 0 bullish
+// stack, 1 bearish stack, 2 short-term up, 3 short-term down, 4 flat. The text
+// lives in protocol.py, where it belongs.
+fn trend_of(ma5: f64, ma10: f64, ma20: f64, last: f64) -> i64 {
+    if ((ma5 > ma10) && (ma10 > ma20) && (last > ma5)) {
+        return 0;
+    }
+    if ((ma5 < ma10) && (ma10 < ma20) && (last < ma5)) {
+        return 1;
+    }
+    if (ma5 > ma10) {
+        return 2;
+    }
+    if (ma5 < ma10) {
+        return 3;
+    }
+    return 4;
+}
+
+// Append a float plus a line break. Written out at each call site on purpose:
+// Aero's String is an owned value, and passing it in and out of a helper is a
+// move of a growable buffer -- not worth the risk for three lines.
+
+// Simple moving average of the close column.
+//
+// Mirrors the upstream behaviour exactly: when the series is shorter than the
+// window it falls back to the mean of the whole series instead of returning
+// NaN (PLAN.md section 5.1).
+#[py_export]
+fn ma(bars: str, close_col: i64, period: i64) -> String {
+    let n = len(bars);
+    let mut b = String::new();
+    b.push_str("#section ma 1\n");
+
+    let cnt = count_rows(bars, n);
+    if (cnt == 0) {
+        return b;
+    }
+
+    let v = ma_val(bars, n, cnt, close_col, period);
+    let t = f2s(v);
+    b.push_str(t);
+    b.push(10);
+    str_free(t);
+    return b;
+}
+
+// Exponential moving average of the close column, seeded with the first value
+// (two-pass form, k = 2/(period+1) -> r = r + k*(v - r)).
+#[py_export]
+fn ema(bars: str, close_col: i64, period: i64) -> String {
+    let n = len(bars);
+    let mut b = String::new();
+    b.push_str("#section ema 1\n");
+
+    let cnt = count_rows(bars, n);
+    if (cnt == 0) {
+        return b;
+    }
+
+    let v = ema_val(bars, n, cnt, close_col, period);
+    let t = f2s(v);
+    b.push_str(t);
+    b.push(10);
+    str_free(t);
+    return b;
+}
+
+// Relative strength index, upstream flavour: a plain mean of the last `period`
+// moves, so a short column yields 50.0 and a column with no losing bar yields
+// 100.0 rather than an error.
+#[py_export]
+fn rsi(bars: str, close_col: i64, period: i64) -> String {
+    let n = len(bars);
+    let mut b = String::new();
+    b.push_str("#section rsi 1\n");
+
+    let cnt = count_rows(bars, n);
+    if (cnt == 0) {
+        return b;
+    }
+
+    let v = rsi_val(bars, n, cnt, close_col, period);
+    let t = f2s(v);
+    b.push_str(t);
+    b.push(10);
+    str_free(t);
+    return b;
+}
+
+// MACD, three columns per row: DIF, DEA, histogram. Unrounded -- the Python
+// side applies upstream's round(., 3) so both sides round the same input once.
+#[py_export]
+fn macd(bars: str, close_col: i64, fast: i64, slow: i64, sig: i64) -> String {
+    let n = len(bars);
+    let mut b = String::new();
+    b.push_str("#section macd 3\n");
+
+    let cnt = count_rows(bars, n);
+    if (cnt == 0) {
+        return b;
+    }
+
+    let dif = macd_part(bars, n, cnt, close_col, fast, slow, sig, 0);
+    let dea = macd_part(bars, n, cnt, close_col, fast, slow, sig, 1);
+    let hist = macd_part(bars, n, cnt, close_col, fast, slow, sig, 2);
+    let t = format("%.17g,%.17g,%.17g", dif, dea, hist);
+    b.push_str(t);
+    b.push(10);
+    str_free(t);
+    return b;
+}
+
+// Average true range, upstream flavour: the plain mean of the last `period`
+// true ranges. Short column -> 0.0.
+#[py_export]
+fn atr(bars: str, high_col: i64, low_col: i64, close_col: i64, period: i64) -> String {
+    let n = len(bars);
+    let mut b = String::new();
+    b.push_str("#section atr 1\n");
+
+    let cnt = count_rows(bars, n);
+    if (cnt == 0) {
+        return b;
+    }
+
+    let v = atr_val(bars, n, cnt, high_col, low_col, close_col, period);
+    let t = f2s(v);
+    b.push_str(t);
+    b.push(10);
+    str_free(t);
+    return b;
+}
+
+// Trend code only. Same windows as upstream: MA5/MA10/MA20 of the close.
+#[py_export]
+fn trend(bars: str, close_col: i64) -> String {
+    let n = len(bars);
+    let mut b = String::new();
+    b.push_str("#section trend 1\n");
+
+    let cnt = count_rows(bars, n);
+    if (cnt == 0) {
+        return b;
+    }
+
+    let last = last_val(bars, n, cnt, close_col);
+    let ma5 = ma_val(bars, n, cnt, close_col, 5);
+    let ma10 = ma_val(bars, n, cnt, close_col, 10);
+    let ma20 = ma_val(bars, n, cnt, close_col, 20);
+    let code = trend_of(ma5, ma10, ma20, last);
+    let t = format("%lld", code);
+    b.push_str(t);
+    b.push(10);
+    str_free(t);
+    return b;
+}
+
+// Everything `TechnicalAnalyzer.get_indicators` reads, in one call and one
+// section: close, ma5, ma10, ma20, rsi14, dif, dea, hist, atr14, volume ratio,
+// trend code. Empty section when the series is shorter than 25 bars, which is
+// upstream's own cutoff.
+#[py_export]
+fn indicators(bars: str, close_col: i64, high_col: i64, low_col: i64, volume_col: i64) -> String {
+    let n = len(bars);
+    let mut b = String::new();
+    b.push_str("#section ind 11\n");
+
+    let cnt = count_rows(bars, n);
+    if (cnt < 25) {
+        return b;
+    }
+
+    let last = last_val(bars, n, cnt, close_col);
+    let ma5 = ma_val(bars, n, cnt, close_col, 5);
+    let ma10 = ma_val(bars, n, cnt, close_col, 10);
+    let ma20 = ma_val(bars, n, cnt, close_col, 20);
+    let rsi14 = rsi_val(bars, n, cnt, close_col, 14);
+    let dif = macd_part(bars, n, cnt, close_col, 12, 26, 9, 0);
+    let dea = macd_part(bars, n, cnt, close_col, 12, 26, 9, 1);
+    let hist = macd_part(bars, n, cnt, close_col, 12, 26, 9, 2);
+    let atr14 = atr_val(bars, n, cnt, high_col, low_col, close_col, 14);
+    let vr = vr_val(bars, n, cnt, volume_col);
+    let tr = trend_of(ma5, ma10, ma20, last);
+
+    let t = format("%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%lld", last, ma5, ma10, ma20, rsi14, dif, dea, hist, atr14, vr, tr);
+    b.push_str(t);
+    b.push(10);
+    str_free(t);
+    return b;
+}
+
+// Larger of two values. There is no math library here, and the two candidates
+// are always finite, so a comparison is the whole implementation.
+fn fmax2(a: f64, b: f64) -> f64 {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+// Offset of the value that follows `key` in a `key=value` params block, or -1
+// when the key is absent. Unknown keys are skipped, so a caller may send a
+// superset of what this build reads. Keys are matched in full: without that,
+// `stop` would answer for `stop_loss_pct` and the caller would never see the
+// mistake. Only the start offset comes back -- the end is row_end from there --
+// because there is no out-parameter or tuple return to carry both.
+fn key_value_start(s: str, n: i64, key: str) -> i64 {
+    let klen = len(key);
+    let mut ls: i64 = 0;
+    while (ls < n) {
+        let le = row_end(s, ls, n);
+        if ((le - ls > klen) && (s[ls + klen] == 61)) {
+            let mut ok = 1;
+            let mut k: i64 = 0;
+            while (k < klen) {
+                if (s[ls + k] != key[k]) {
+                    ok = 0;
+                    break;
+                }
+                k = k + 1;
+            }
+            if (ok == 1) {
+                return ls + klen + 1;
+            }
+        }
+        ls = le + 1;
+    }
+    return 0 - 1;
+}
+
+// Decimal parameter, or `dflt` when the key is absent.
+fn param_f(s: str, n: i64, key: str, dflt: f64) -> f64 {
+    let j = key_value_start(s, n, key);
+    if (j < 0) {
+        return dflt;
+    }
+    return dec_f64(s, j, row_end(s, j, n));
+}
+
+// Integer parameter, or `dflt` when the key is absent.
+//
+// Digits are folded straight into an i64 rather than going through dec_f64,
+// because Aero has no f64 -> i64 conversion and an array bound needs an i64.
+// Only non-negative values are supported, which covers every key this build
+// reads as an integer.
+fn param_i(s: str, n: i64, key: str, dflt: i64) -> i64 {
+    let j = key_value_start(s, n, key);
+    if (j < 0) {
+        return dflt;
+    }
+    let le = row_end(s, j, n);
+    let mut i = j;
+    let mut acc: i64 = 0;
+    let mut got = 0;
+    while ((i < le) && (s[i] >= 48) && (s[i] <= 57)) {
+        acc = acc * 10 + (s[i] - 48);
+        got = 1;
+        i = i + 1;
+    }
+    if (got == 0) {
+        return dflt;
+    }
+    return acc;
+}
+
+// Whole-market pre-screen: which stocks are worth spending an AI call on.
+//
+// Upstream walks every listed stock, drops the ones that are outside the price
+// band, unaffordable (one lot costs more than the whole account), too big a
+// slice of the account, or too expensive to trade round trip, then keeps the
+// top few by daily change. This runs over the entire market on every scan, so
+// it is the one part of the scan worth pushing down; the rule scoring that
+// follows it runs on ten survivors and stays in Python, where it can reuse
+// CPython's own `round`.
+//
+// Input is a quote table, one row per stock -- `sym,price,change_pct` -- which
+// is exactly what upstream's data source hands `get_candidates`. Full k-lines
+// are not needed and would make the payload four orders of magnitude larger.
+//
+// Name-based exclusions (ST, and the N/C prefixes) never reach this function.
+// The protocol has no escaping, so the caller drops those symbols before
+// building the payload; a name cannot travel as text through this wire format
+// (PLAN.md section 5.2).
+#[py_export]
+fn prescreen(quotes: str, params: str) -> String {
+    let np = len(params);
+    let total = param_f(params, np, "total_assets", 50000.0);
+    let top_n = param_i(params, np, "top_n", 10);
+    let lot = param_f(params, np, "lot_size", 100.0);
+    let min_price = param_f(params, np, "min_price", 5.0);
+    let max_price = param_f(params, np, "max_price", 500.0);
+    let max_lot_ratio = param_f(params, np, "max_one_lot_ratio", 0.3);
+    let max_rt = param_f(params, np, "max_round_trip_cost_pct", 1.5);
+    let comm_rate = param_f(params, np, "commission_rate", 0.0003);
+    let min_comm = param_f(params, np, "min_commission", 5.0);
+    let stamp = param_f(params, np, "stamp_tax_rate", 0.001);
+
+    // Ceiling on the kept rows. The wrapper refuses a larger top_n; this clamp
+    // is the second line of defence, because overrunning a fixed array here
+    // corrupts the stack rather than raising.
+    let cap: i64 = 32;
+    let mut keep = top_n;
+    if (keep > cap) {
+        keep = cap;
+    }
+
+    let zeros: [f64; 32] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let mut vsym = zeros;
+    let mut vprice = zeros;
+    let mut vchg = zeros;
+    let mut vrt = zeros;
+    let mut vlot = zeros;
+
+    let n = len(quotes);
+    let mut ls: i64 = 0;
+    let mut cnt: i64 = 0;
+    while (ls < n) {
+        let le = row_end(quotes, ls, n);
+        let ss = field_start(quotes, ls, le, 0);
+        let se = field_stop(quotes, ss, le);
+        let ps = field_start(quotes, ls, le, 1);
+        let pe = field_stop(quotes, ps, le);
+        let cs = field_start(quotes, ls, le, 2);
+        let ce = field_stop(quotes, cs, le);
+
+        let price = dec_f64(quotes, ps, pe);
+        let chg = dec_f64(quotes, cs, ce);
+        let one_lot = price * lot;
+        let comm = fmax2(one_lot * comm_rate, min_comm);
+        let rt_cost = (comm * 2.0 + one_lot * stamp) / one_lot * 100.0;
+
+        let mut take = 1;
+        if (price <= 0.0) {
+            take = 0;
+        }
+        if (price < min_price) {
+            take = 0;
+        }
+        if (price > max_price) {
+            take = 0;
+        }
+        if (one_lot > total) {
+            take = 0;
+        }
+        if (one_lot / total > max_lot_ratio) {
+            take = 0;
+        }
+        if (rt_cost > max_rt) {
+            take = 0;
+        }
+
+        if (take == 1) {
+            // Sorted insert by change, best first. Ties keep arrival order,
+            // which is the ascending-symbol order the caller sent, so this
+            // matches a stable descending sort upstream does in Python.
+            let mut p: i64 = 0;
+            while (p < cnt) {
+                if (chg > vchg[p]) {
+                    break;
+                }
+                p = p + 1;
+            }
+            if (p < keep) {
+                let mut q = cnt;
+                if (q >= keep) {
+                    q = keep - 1;
+                }
+                while (q > p) {
+                    vsym[q] = vsym[q - 1];
+                    vprice[q] = vprice[q - 1];
+                    vchg[q] = vchg[q - 1];
+                    vrt[q] = vrt[q - 1];
+                    vlot[q] = vlot[q - 1];
+                    q = q - 1;
+                }
+                vsym[p] = dec_f64(quotes, ss, se);
+                vprice[p] = price;
+                vchg[p] = chg;
+                vrt[p] = rt_cost;
+                vlot[p] = one_lot;
+                if (cnt < keep) {
+                    cnt = cnt + 1;
+                }
+            }
+        }
+        ls = le + 1;
+    }
+
+    let mut b = String::new();
+    b.push_str("#section scan 5\n");
+    let mut i: i64 = 0;
+    while (i < cnt) {
+        // The symbol column prints through %.0f: it is the share code as an
+        // integer, well inside the range where f64 is exact, and there is no
+        // i64 printing route for it anyway.
+        let t = format("%.0f,%.17g,%.17g,%.17g,%.17g", vsym[i], vprice[i], vchg[i], vrt[i], vlot[i]);
+        b.push_str(t);
+        b.push(10);
+        str_free(t);
+        i = i + 1;
+    }
+    return b;
+}
+
+// Echo one parsed column back as %.17g, one value per line.
+//
+// This is the protocol round-trip hook behind acceptance gate A7: whatever
+// goes in as decimal text has to come back out at full f64 precision. It also
+// makes the decoder inspectable when a parity test disagrees.
+#[py_export]
+fn echo_col(bars: str, col: i64) -> String {
+    let n = len(bars);
+    let mut b = String::new();
+    b.push_str("#section echo 1\n");
+    let mut i: i64 = 0;
+    while (i < n) {
+        let re = row_end(bars, i, n);
+        if (re > i) {
+            let t = f2s(col_f64(bars, i, re, col));
+            b.push_str(t);
+            b.push(10);
+            str_free(t);
+        }
+        i = re + 1;
+    }
+    return b;
+}
