@@ -83,8 +83,24 @@ kernel 精确复现 quant-sim 	echnical.py 的行为（包括它当前版本里 
 - Windows wheel 已测试；Linux/macOS wheel 需要在对应平台编译（Aero 编译器支持三平台）。
 - 当前 wire format 是 CSV 文本 + 固定列号，性能最优方案（裸 f64 数组 FFI）留作后续版本。
 
+## 免责声明 · Disclaimer
+
+**本项目仅用于技术研究与学习目的，不构成任何投资建议。**
+
+quant-sim-aero 是 quant-sim 的技术指标计算加速内核，仅替换数值计算实现，不涉及行情数据获取、交易信号生成、模拟撮合或任何资金操作。作者不对任何人基于本项目做出的交易决策负责，不对因使用本项目导致的直接或间接损失承担任何责任。
+
+量化交易存在极高风险，过往业绩不代表未来表现。请在充分了解风险的前提下独立做出投资决策。
+
+---
+
+**This project is for technical research and educational purposes only. It does not constitute any investment advice.**
+
+quant-sim-aero is a technical-indicator acceleration kernel for quant-sim. It only replaces the numerical computation implementation and does not involve market data acquisition, trading signal generation, order matching, or any capital operations. The author is not responsible for any trading decisions made by anyone based on this project, nor for any direct or indirect losses caused by its use.
+
+Quantitative trading carries extremely high risks. Past performance does not represent future results. Please make independent investment decisions only after fully understanding the risks.
+
 ## License
 
 MIT
 
-> **贡献者说明：** 本仓库贡献者账号为 **SereinTeam (SereinCin)**。若您看到其他名称（如 Serein "s3r3in" 等），系 Git 客户端身份配置错误导致的显示异常。
+> **贡献者说明 / Contributor Notice：** 本仓库唯一合法贡献者账号为 **SereinTeam (SereinCin)**。若您看到其他名称，系 Git 客户端身份配置错误导致的显示异常。
